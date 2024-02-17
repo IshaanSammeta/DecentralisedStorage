@@ -2,18 +2,18 @@
 <html>
 <head>
     <title>File Upload/Download</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style5.css') }}">
+
 </head>
 <body>
     <h2>File Upload/Download</h2>
-    {% with messages = get_flashed_messages() %}
-    {% if messages %}
     <ul>
-        {% for message in messages %}
-        <li>{{ message }}</li>
-        {% endfor %}
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+                <li class="{{ category }}">{{ message }}</li>
+            {% endfor %}
+        {% endwith %}
     </ul>
-    {% endif %}
-    {% endwith %}
     <a href="{{ url_for('logout') }}">Logout</a><br><br>
     <form method="POST" action="/upload" enctype="multipart/form-data">
         <input type="file" name="file" accept=".txt, .pdf">
@@ -22,7 +22,7 @@
     <h3>Uploaded Files:</h3>
     <ul>
         {% for file in files %}
-        <li><a href="{{ url_for('download_file', filename=file) }}">{{ file }}</a></li>
+            <li><a href="{{ url_for('download_file', filename=file) }}">{{ file }}</a></li>
         {% endfor %}
     </ul>
 </body>
