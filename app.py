@@ -1,7 +1,12 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, g
 import sqlite3
 import os
+from base64 import b64decode
+import binascii
 import requests
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from base64 import b64encode, b64decode
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'
@@ -24,7 +29,7 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS user_files (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER,
-                        ipfs_hash TEXT NOT NULL,
+                        encrypted_hash TEXT NOT NULL,
                         FOREIGN KEY (user_id) REFERENCES users (id)
                     )
                 ''')
@@ -50,9 +55,6 @@ init_db()
 # Replace with the IP address and port of your IPFS node
 ipfs_api_url = "http://localhost:5001/api/v0"
 
-# Dictionary to store uploaded file information (IPFS hashes)
-uploaded_files = {}
-
 
 # Function to upload a file to IPFS
 def upload_to_ipfs(file_content):
@@ -65,11 +67,6 @@ def upload_to_ipfs(file_content):
     else:
         return None
 
-# Function to save user-file association in the database
-def save_user_file(user_id, ipfs_hash):
-    db = get_db()
-    db.execute('INSERT INTO user_files (user_id, ipfs_hash) VALUES (?, ?)', [user_id, ipfs_hash])
-    db.commit()
 
 # Function to download a file from IPFS
 def download_from_ipfs(ipfs_hash):
@@ -81,16 +78,55 @@ def download_from_ipfs(ipfs_hash):
     else:
         return None
 
-# Actual data retrieval logic to get IPFS hashes
-# Modify this function in your app.py
-def get_user_ipfs_hashes(user_id):
-    results = query_db('SELECT ipfs_hash FROM user_files WHERE user_id = ?', [user_id])
+
+# Encryption
+def encrypt_ipfs_hash(ipfs_hash, key):
+    cipher = AES.new(key, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(ipfs_hash.encode())
+    return b64encode(cipher.nonce + tag + ciphertext)
+
+
+def is_base64_encoded(s):
+    try:
+        # Attempt to decode the string
+        b64decode(s)
+        return True
+    except binascii.Error:
+        return False
+
+# Decryption
+def decrypt_ipfs_hash(encrypted_hash, key):
+    encrypted_data = b64decode(encrypted_hash)
+    nonce = encrypted_data[:16]
+    tag = encrypted_data[16:32]
+    ciphertext = encrypted_data[32:]
+    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+    return plaintext.decode()
+
+
+# Function to save encrypted hash in the database
+def save_user_file(user_id, encrypted_hash):
+    db = get_db()
+    db.execute('INSERT INTO user_files (user_id, encrypted_hash) VALUES (?, ?)', [user_id, encrypted_hash])
+    db.commit()
+
+# Function to retrieve encrypted hashes from the database
+def get_user_encrypted_hashes(user_id):
+    results = query_db('SELECT encrypted_hash FROM user_files WHERE user_id = ?', [user_id])
     return [result[0] for result in results]
+
+# Function to remove encrypted hash from the database
+def remove_user_file(user_id, encrypted_hash):
+    db = get_db()
+    db.execute('DELETE FROM user_files WHERE user_id = ? AND encrypted_hash = ?', [user_id, encrypted_hash])
+    db.commit()
+
+
 
 @app.route('/')
 def welcome():
     return render_template('welcome.html')
-
 
 @app.route('/index')
 def index():
@@ -99,10 +135,9 @@ def index():
         return redirect(url_for('login'))
 
     user_id = session['user_id']
-    user_ipfs_hashes = get_user_ipfs_hashes(user_id)
+    user_encrypted_hashes = get_user_encrypted_hashes(user_id)
 
-    return render_template('index.html', files=user_ipfs_hashes)
-
+    return render_template('index.html', encrypted_hashes=user_encrypted_hashes)
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -119,42 +154,93 @@ def upload():
         flash('No selected file', 'error')
         return redirect(url_for('index'))
 
+    key = request.form.get('key', '')  # Get the encryption key from the form
+    if not key:
+        flash('Encryption key is required', 'error')
+        return redirect(url_for('index'))
+
     file_content = file.read()
     ipfs_hash = upload_to_ipfs(file_content)
 
     if ipfs_hash:
+        # Encrypt the IPFS hash
+        key_bytes = key.encode('utf-8')
+        encrypted_hash = encrypt_ipfs_hash(ipfs_hash, key_bytes)
+
         user_id = session['user_id']
-        save_user_file(user_id, ipfs_hash)
+        save_user_file(user_id, encrypted_hash)
         flash('File uploaded to IPFS successfully', 'success')
     else:
         flash('Failed to upload the file to IPFS', 'error')
 
     return redirect(url_for('index'))
 
-
-@app.route('/download/<filename>')
-def download_file(filename):
+@app.route('/download/<encrypted_hash>')
+def download(encrypted_hash):
     if not session.get('logged_in'):
         flash('Please log in first.', 'error')
         return redirect(url_for('login'))
 
     user_id = session['user_id']
-    user_ipfs_hashes = get_user_ipfs_hashes(user_id)
+    user_encrypted_hashes = get_user_encrypted_hashes(user_id)
 
-    if filename not in user_ipfs_hashes:
+    if encrypted_hash not in user_encrypted_hashes:
         flash('You do not have permission to download this file.', 'error')
         return redirect(url_for('index'))
 
-    ipfs_hash = filename
-    downloaded_content = download_from_ipfs(ipfs_hash)
+    # Decrypt the encrypted hash to get the IPFS hash
+    key = request.args.get('key', '')  # Assuming the key is provided as a query parameter
+    decrypted_ipfs_hash = decrypt_ipfs_hash(encrypted_hash, key)
 
-    if downloaded_content:
-        response = Response(downloaded_content, content_type='application/octet-stream')
-        response.headers['Content-Disposition'] = f'attachment; filename={ipfs_hash}.txt'
-        return response
+    if decrypted_ipfs_hash:
+        downloaded_content = download_from_ipfs(decrypted_ipfs_hash)
+
+        if downloaded_content:
+            response = Response(downloaded_content, content_type='application/octet-stream')
+            response.headers['Content-Disposition'] = f'attachment; filename={decrypted_ipfs_hash}.txt'
+            return response
+        else:
+            flash('Failed to download the file from IPFS', 'error')
     else:
-        flash('Failed to download the file from IPFS', 'error')
+        flash('Failed to decrypt the IPFS hash', 'error')
+
+    return redirect(url_for('index'))
+
+@app.route('/remove', methods=['POST'])
+def remove():
+    if not session.get('logged_in'):
+        flash('Please log in first.', 'error')
+        return redirect(url_for('login'))
+
+    user_id = session['user_id']
+    encrypted_hash = request.form.get('encrypted_hash', '')
+
+    if not encrypted_hash:
+        flash('Encrypted hash is required', 'error')
         return redirect(url_for('index'))
+
+    remove_user_file(user_id, encrypted_hash)
+    flash('File removed successfully', 'success')
+    return redirect(url_for('index'))
+
+
+
+@app.route('/decrypt', methods=['POST'])
+def decrypt():
+    if not session.get('logged_in'):
+        flash('Please log in first.', 'error')
+        return redirect(url_for('login'))
+
+    encrypted_hash = request.form.get('encrypted_hash')
+    key = request.form.get('key')
+    key_bytes = key.encode('utf-8')
+    if not encrypted_hash or not key:
+        flash('Encrypted hash or key missing.', 'error')
+        return redirect(url_for('index'))
+
+    decrypted_hash = decrypt_ipfs_hash(encrypted_hash[1:], key_bytes)
+    flash('Decryption successful', 'success')
+    return render_template('decryption_result.html', decrypted_hash=decrypted_hash)
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -174,7 +260,6 @@ def register():
             return redirect(url_for('login'))
     return render_template('register.html')
 
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -193,7 +278,6 @@ def login():
             flash('Login failed. Please try again.', 'error')
     return render_template('login.html')
 
-
 @app.route('/logout')
 def logout():
     if session.get('logged_in'):
@@ -201,7 +285,6 @@ def logout():
         session.pop('user_id', None)
         flash('Logout successful', 'success')
     return redirect(url_for('login'))
-
 
 if __name__ == '__main__':
     app.run(debug=True)
